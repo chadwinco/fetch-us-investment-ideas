@@ -19,6 +19,13 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 - US market guardrail (skip/fail if US is excluded)
 - sector/industry include/exclude filtering
 
+## Shared Contract Guardrails
+- Use one run folder per screen: `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/`.
+- Append queue rows only to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
+- Ensure every queue row includes required fields: `ticker`, `exchange_country` (set `US` for this skill).
+- Prefer including recommended queue fields when available: `company`, `exchange`, `sector`, `industry`, `thesis`, `source`, `generated_at_utc`, `queued_at_utc`, `source_output`.
+- Do not repurpose reserved shared primitive paths.
+
 ## Skill Path (set once)
 
 ```bash
@@ -30,22 +37,29 @@ export FETCH_US_INVESTMENT_IDEAS_CLI="$FETCH_US_INVESTMENT_IDEAS_ROOT/scripts/fe
 
 ## Quick Start
 1. Ensure `.venv` is active and install this skill's optional script dependencies from `agents/openai.yaml` (`dependencies.python_packages`).
-2. Choose path:
+2. Set a run id and create the screen run folder:
+
+```bash
+SCREEN_RUN_ID="$(date -u +%Y-%m-%d-%H%M%S)"
+mkdir -p "<DATA_ROOT>/idea-screens/$SCREEN_RUN_ID"
+```
+
+3. Choose path:
 - LLM web-research path: gather ideas with native web tools and write output JSON directly.
 - Finviz helper path:
 
 ```bash
 python3 "$FETCH_US_INVESTMENT_IDEAS_CLI" \
   --limit 25 \
-  --output <DATA_ROOT>/idea-screens/$(date +%F)/us-investment-ideas.json
+  --output <DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/us-investment-ideas.json
 ```
 
-3. Ensure output JSON has an `ideas` array with `ticker` and `thesis`.
-4. Append new ideas to queue log if not already appended by script:
+4. Ensure output JSON has an `ideas` array with `ticker`, `exchange_country`, and `thesis`.
+5. Append new ideas to queue log if not already appended by script:
 
 ```bash
 python3 "${CHADWIN_SKILLS_DIR:-${CODEX_HOME:-$HOME/.codex}/skills}/chadwin-research/scripts/company_idea_queue.py" append-json \
-  --ideas-json <DATA_ROOT>/idea-screens/$(date +%F)/us-investment-ideas.json \
+  --ideas-json <DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/us-investment-ideas.json \
   --source fetch-us-investment-ideas
 ```
 
@@ -61,6 +75,7 @@ The output JSON must follow this top-level shape:
   "ideas": [
     {
       "ticker": "EXAMPLE",
+      "exchange_country": "US",
       "company": "Example Inc.",
       "exchange": "NASDAQ",
       "sector": "Technology",
@@ -83,8 +98,8 @@ Downstream consumers should read `ideas[*].ticker` and `ideas[*].thesis`.
 2. Keep exchange scope to NASDAQ/NYSE/AMEX unless explicitly asked to broaden.
 3. Apply preferences unless user overrides.
 4. Write output JSON for deterministic handoff.
-5. Verify non-empty `ideas`, with `ticker` + `thesis` per entry.
-6. Confirm queue append in `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
+5. Verify non-empty `ideas`, with `ticker`, `exchange_country`, and `thesis` per entry.
+6. Confirm queue append in `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl` and verify each row includes `ticker` + `exchange_country`.
 
 ## Key Flags (Finviz helper script)
 - `--limit`: max number of returned ideas.
