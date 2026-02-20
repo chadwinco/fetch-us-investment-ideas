@@ -9,7 +9,7 @@ description: Fetch a structured list of possible US stock investment ideas with 
 This skill is LLM-driven. Do not force all idea generation through one deterministic screen.
 
 Use one of these paths per run:
-- LLM web-research path (default when user asks for flexibility): use native browsing/search, then emit structured JSON.
+- LLM web-research path (default when user asks for flexibility): use native browsing/search, then append results directly to `screener-results.jsonl`.
 - Finviz helper path (optional): run `scripts/fetch_us_investment_ideas.py` when a deterministic value/quality seed list is useful.
 - Optional local filing-seeded path: if filing snapshot JSONL files already exist under `<DATA_ROOT>/daily-sec-filings/*/*.jsonl` from an external process, use them as a seed universe before thesis selection.
 
@@ -22,6 +22,7 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 ## Shared Contract Guardrails
 - Use one run folder per screen: `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/`.
 - Append queue rows only to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
+- Do not create sidecar JSON files in the run folder.
 - Ensure every queue row includes required fields: `ticker`, `exchange_country` (set `US` for this skill).
 - Prefer including recommended queue fields when available: `company`, `exchange`, `sector`, `industry`, `thesis`, `source`, `generated_at_utc`, `queued_at_utc`, `source_output`.
 - Do not repurpose reserved shared primitive paths.
@@ -45,50 +46,36 @@ mkdir -p "<DATA_ROOT>/idea-screens/$SCREEN_RUN_ID"
 ```
 
 3. Choose path:
-- LLM web-research path: gather ideas with native web tools and write output JSON directly.
+- LLM web-research path: gather ideas with native web tools and append queue rows directly to `screener-results.jsonl`.
 - Finviz helper path:
 
 ```bash
 python3 "$FETCH_US_INVESTMENT_IDEAS_CLI" \
   --limit 25 \
-  --output <DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/us-investment-ideas.json
+  --ideas-log <DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/screener-results.jsonl
 ```
 
-4. Ensure output JSON has an `ideas` array with `ticker`, `exchange_country`, and `thesis`.
-5. Append new ideas to queue log if not already appended by script:
+4. Verify `<DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/screener-results.jsonl` exists and rows include `ticker`, `exchange_country`, and `thesis`.
 
-```bash
-python3 "${CHADWIN_SKILLS_DIR:-${CODEX_HOME:-$HOME/.codex}/skills}/chadwin-research/scripts/company_idea_queue.py" append-json \
-  --ideas-json <DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/us-investment-ideas.json \
-  --source fetch-us-investment-ideas
-```
-
-## Required Output Shape
-The output JSON must follow this top-level shape:
+## Required Queue Row Shape
+Each JSONL row in `screener-results.jsonl` should include:
 
 ```json
 {
+  "ticker": "EXAMPLE",
+  "exchange_country": "US",
+  "company": "Example Inc.",
+  "exchange": "NASDAQ",
+  "sector": "Technology",
+  "industry": "Software - Application",
+  "thesis": "Concise rationale",
+  "source": "fetch-us-investment-ideas",
   "generated_at_utc": "2026-02-12T18:00:00+00:00",
-  "source": "finviz_screener | llm_web_research | filing_seeded",
-  "universe": {"country": "USA", "exchanges": ["NASDAQ", "NYSE", "AMEX"]},
-  "filters": {...},
-  "ideas": [
-    {
-      "ticker": "EXAMPLE",
-      "exchange_country": "US",
-      "company": "Example Inc.",
-      "exchange": "NASDAQ",
-      "sector": "Technology",
-      "industry": "Software - Application",
-      "score": 87.5,
-      "thesis": "Concise rationale",
-      "metrics": {...}
-    }
-  ]
+  "queued_at_utc": "2026-02-12T18:00:10+00:00"
 }
 ```
 
-Downstream consumers should read `ideas[*].ticker` and `ideas[*].thesis`.
+Downstream consumers should read row-level `ticker` and `thesis`.
 
 ## Workflow
 1. Decide path first:
@@ -97,8 +84,8 @@ Downstream consumers should read `ideas[*].ticker` and `ideas[*].thesis`.
 - If user asked for filing-date- or filing-form-driven ideas and local filing snapshots already exist, seed from those files.
 2. Keep exchange scope to NASDAQ/NYSE/AMEX unless explicitly asked to broaden.
 3. Apply preferences unless user overrides.
-4. Write output JSON for deterministic handoff.
-5. Verify non-empty `ideas`, with `ticker`, `exchange_country`, and `thesis` per entry.
+4. Append ideas directly to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
+5. Verify non-empty queue rows, with `ticker`, `exchange_country`, and `thesis` per entry.
 6. Confirm queue append in `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl` and verify each row includes `ticker` + `exchange_country`.
 
 ## Key Flags (Finviz helper script)
@@ -107,7 +94,6 @@ Downstream consumers should read `ideas[*].ticker` and `ideas[*].thesis`.
 - `--min-market-cap-b`: minimum market cap in billions USD.
 - `--max-pe`: valuation cap (trailing P/E).
 - `--min-roe`, `--min-roic`, `--min-operating-margin`, `--min-profit-margin`, `--max-debt-to-equity`: quality gates.
-- `--output`: write JSON to file.
 - `--compact`: emit minified JSON.
 - `--ideas-log`: override screener results path (file or directory; defaults to `<DATA_ROOT>/idea-screens/**/screener-results.jsonl`).
 - `--base-dir`: override repo root used for queue log resolution.

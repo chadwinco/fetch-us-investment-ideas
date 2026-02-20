@@ -170,11 +170,6 @@ def parse_args() -> argparse.Namespace:
         help="Delay between HTTP requests to reduce rate-limit risk.",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        help="Optional output JSON file path. Print to stdout when omitted.",
-    )
-    parser.add_argument(
         "--compact",
         action="store_true",
         help="Emit compact JSON (no indentation).",
@@ -601,18 +596,14 @@ def main() -> int:
     )
     output_text = json.dumps(payload, indent=None if args.compact else 2)
 
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(output_text + "\n", encoding="utf-8")
-    else:
-        print(output_text)
+    print(output_text)
 
     append_new_ideas(
         base_dir=base_dir,
         ideas=ideas,
         source="fetch-us-investment-ideas",
         generated_at_utc=payload.get("generated_at_utc"),
-        source_output=str(args.output) if args.output else "",
+        source_output=args.ideas_log or "",
         ideas_log=args.ideas_log,
     )
 
