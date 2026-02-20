@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -168,11 +167,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Delay between HTTP requests to reduce rate-limit risk.",
-    )
-    parser.add_argument(
-        "--compact",
-        action="store_true",
-        help="Emit compact JSON (no indentation).",
     )
     parser.add_argument(
         "--base-dir",
@@ -594,9 +588,6 @@ def main() -> int:
             else None
         ),
     )
-    output_text = json.dumps(payload, indent=None if args.compact else 2)
-
-    print(output_text)
 
     append_new_ideas(
         base_dir=base_dir,

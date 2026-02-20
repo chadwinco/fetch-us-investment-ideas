@@ -22,7 +22,6 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 ## Shared Contract Guardrails
 - Use one run folder per screen: `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/`.
 - Append queue rows only to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
-- Do not create sidecar JSON files in the run folder.
 - Ensure every queue row includes required fields: `ticker`, `exchange_country` (set `US` for this skill).
 - Prefer including recommended queue fields when available: `company`, `exchange`, `sector`, `industry`, `thesis`, `source`, `generated_at_utc`, `queued_at_utc`, `source_output`.
 - Do not repurpose reserved shared primitive paths.
@@ -56,6 +55,7 @@ python3 "$FETCH_US_INVESTMENT_IDEAS_CLI" \
 ```
 
 4. Verify `<DATA_ROOT>/idea-screens/$SCREEN_RUN_ID/screener-results.jsonl` exists and rows include `ticker`, `exchange_country`, and `thesis`.
+5. Present filtered subsets in chat output.
 
 ## Required Queue Row Shape
 Each JSONL row in `screener-results.jsonl` should include:
@@ -94,7 +94,6 @@ Downstream consumers should read row-level `ticker` and `thesis`.
 - `--min-market-cap-b`: minimum market cap in billions USD.
 - `--max-pe`: valuation cap (trailing P/E).
 - `--min-roe`, `--min-roic`, `--min-operating-margin`, `--min-profit-margin`, `--max-debt-to-equity`: quality gates.
-- `--compact`: emit minified JSON.
 - `--ideas-log`: override screener results path (file or directory; defaults to `<DATA_ROOT>/idea-screens/**/screener-results.jsonl`).
 - `--base-dir`: override repo root used for queue log resolution.
 - `--preferences-path`: override preferences path (default `<DATA_ROOT>/user_preferences.json`).
