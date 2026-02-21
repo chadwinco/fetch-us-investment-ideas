@@ -16,6 +16,26 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 SKILLS_DIR_ENV_VAR = "CHADWIN_SKILLS_DIR"
+APP_ROOT_ENV_VAR = "CHADWIN_APP_ROOT"
+
+
+def _detect_app_root() -> Path | None:
+    configured = os.getenv(APP_ROOT_ENV_VAR, "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = (Path.cwd() / configured_path).resolve()
+        if configured_path.exists():
+            return configured_path
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        candidate = start.resolve()
+        if candidate.is_file():
+            candidate = candidate.parent
+        for parent in [candidate, *candidate.parents]:
+            if (parent / ".claude" / "skills").exists() or (parent / ".agents" / "skills").exists():
+                return parent
+    return None
 
 
 def _resolve_queue_scripts_dir() -> Path:
@@ -28,18 +48,32 @@ def _resolve_queue_scripts_dir() -> Path:
             configured_path = (Path.cwd() / configured_path).resolve()
         candidates.append(configured_path / "chadwin-research" / "scripts")
 
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if codex_home:
-        candidates.append(Path(codex_home).expanduser() / "skills" / "chadwin-research" / "scripts")
-
     # Sibling-skill fallback when this skill is installed into a skills root.
     candidates.append(Path(__file__).resolve().parents[2] / "chadwin-research" / "scripts")
 
+    app_root = _detect_app_root()
+    if app_root is not None:
+        candidates.append(app_root / ".claude" / "skills" / "chadwin-research" / "scripts")
+        candidates.append(app_root / ".agents" / "skills" / "chadwin-research" / "scripts")
+
+    candidates.append(Path.home() / ".claude" / "skills" / "chadwin-research" / "scripts")
+    candidates.append(Path.home() / ".codex" / "skills" / "chadwin-research" / "scripts")
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
     for candidate in candidates:
+        normalized = candidate.expanduser().resolve()
+        key = str(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    for candidate in deduped:
         if candidate.exists():
             return candidate
 
-    checked = ", ".join(str(path) for path in candidates)
+    checked = ", ".join(str(path) for path in deduped)
     raise RuntimeError(
         "Unable to locate chadwin-research queue scripts. "
         f"Checked: {checked}. Set {SKILLS_DIR_ENV_VAR} when skills are installed elsewhere."

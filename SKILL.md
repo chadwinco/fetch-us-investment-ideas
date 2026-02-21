@@ -19,6 +19,10 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 - US market guardrail (skip/fail if US is excluded)
 - sector/industry include/exclude filtering
 
+## Invocation Style (Codex + Claude)
+- Codex explicit invocation: `$fetch-us-investment-ideas`.
+- Claude explicit invocation: invoke the `fetch-us-investment-ideas` skill in natural language.
+
 ## Shared Contract Guardrails
 - Use one run folder per screen: `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/`.
 - Append queue rows only to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
@@ -29,14 +33,15 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 ## Skill Path (set once)
 
 ```bash
-export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-export CHADWIN_SKILLS_DIR="${CHADWIN_SKILLS_DIR:-$CODEX_HOME/skills}"
+export CHADWIN_SKILLS_DIR="${CHADWIN_SKILLS_DIR:-$HOME/.claude/skills}"
 export FETCH_US_INVESTMENT_IDEAS_ROOT="$CHADWIN_SKILLS_DIR/fetch-us-investment-ideas"
 export FETCH_US_INVESTMENT_IDEAS_CLI="$FETCH_US_INVESTMENT_IDEAS_ROOT/scripts/fetch_us_investment_ideas.py"
 ```
 
+For Codex-only environments, set `CHADWIN_SKILLS_DIR="$HOME/.codex/skills"` instead.
+
 ## Quick Start
-1. Ensure `.venv` is active and install this skill's optional script dependencies from `agents/openai.yaml` (`dependencies.python_packages`).
+1. Ensure `.venv` is active and install this skill's optional script dependencies from `references/optional-python.txt`.
 2. Set a run id and create the screen run folder:
 
 ```bash
@@ -103,4 +108,4 @@ Downstream consumers should read row-level `ticker` and `thesis`.
 - If Finviz output is empty, loosen thresholds (for example raise `--max-pe` or lower `--min-roic`).
 - If preferences exclude US market, update `<DATA_ROOT>/user_preferences.json` or rerun with `--ignore-preferences`.
 - If requests fail intermittently, raise `--request-delay` and retry.
-- If script dependencies are missing, install the packages listed in `agents/openai.yaml`.
+- If script dependencies are missing, install the packages listed in `references/optional-python.txt`.
