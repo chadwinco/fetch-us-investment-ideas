@@ -1,7 +1,7 @@
 interface:
   display_name: "Fetch US Investment Ideas"
   short_description: "Generate US ticker ideas with short value-quality theses"
-  default_prompt: "Use $fetch-us-investment-ideas as an LLM-driven workflow: use native web research for flexible sourcing, the local Finviz helper for bounded screening, and optional filing-seeded sourcing when local <DATA_ROOT>/daily-sec-filings JSONL snapshots already exist from external pipelines. Apply <DATA_ROOT>/user_preferences.json filters by default and append new tickers to per-screen queue files at <DATA_ROOT>/idea-screens/**/screener-results.jsonl."
+  default_prompt: "Use $fetch-us-investment-ideas as an LLM-first operator. Create SCREEN_RUN_ID in strict format YYYY-MM-DD-HHMMSS (no suffixes/slugs). Start with Finviz by running scripts/fetch_us_investment_ideas.py to build candidate context. If Finviz options fit the user query, apply --selection-json (prefer --selection-json - via stdin) and append final rows to <DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl. If Finviz options do not fit, use web search in the outer loop to source ideas and still write final rows to the same screener-results.jsonl file. Handle sector/industry preference matching in the outer-loop LLM. After successful append, sidecar artifacts should be cleaned unless --keep-artifacts is explicitly requested. Required keys: ticker, exchange_country=US. Preferred keys: company, exchange, sector, industry, market, thesis."
   icon_small: "./assets/chadwin-icon.svg"
   icon_large: "./assets/chadwin-icon.png"
   brand_color: "#F43C00"

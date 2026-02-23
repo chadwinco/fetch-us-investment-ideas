@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Fetch possible US stock investment ideas using a value + quality screen."""
+"""Fetch US market candidates and append LLM-selected ideas to screener-results.jsonl."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -15,82 +17,16 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-SKILLS_DIR_ENV_VAR = "CHADWIN_SKILLS_DIR"
+APP_DATA_DIR_NAME = "Chadwin"
+DATA_ROOT_ENV_VAR = "CHADWIN_DATA_DIR"
 APP_ROOT_ENV_VAR = "CHADWIN_APP_ROOT"
-
-
-def _detect_app_root() -> Path | None:
-    configured = os.getenv(APP_ROOT_ENV_VAR, "").strip()
-    if configured:
-        configured_path = Path(configured).expanduser()
-        if not configured_path.is_absolute():
-            configured_path = (Path.cwd() / configured_path).resolve()
-        if configured_path.exists():
-            return configured_path
-
-    for start in (Path.cwd(), Path(__file__).resolve()):
-        candidate = start.resolve()
-        if candidate.is_file():
-            candidate = candidate.parent
-        for parent in [candidate, *candidate.parents]:
-            if (parent / ".claude" / "skills").exists() or (parent / ".agents" / "skills").exists():
-                return parent
-    return None
-
-
-def _resolve_queue_scripts_dir() -> Path:
-    candidates: list[Path] = []
-
-    configured = os.getenv(SKILLS_DIR_ENV_VAR, "").strip()
-    if configured:
-        configured_path = Path(configured).expanduser()
-        if not configured_path.is_absolute():
-            configured_path = (Path.cwd() / configured_path).resolve()
-        candidates.append(configured_path / "chadwin-research" / "scripts")
-
-    # Sibling-skill fallback when this skill is installed into a skills root.
-    candidates.append(Path(__file__).resolve().parents[2] / "chadwin-research" / "scripts")
-
-    app_root = _detect_app_root()
-    if app_root is not None:
-        candidates.append(app_root / ".claude" / "skills" / "chadwin-research" / "scripts")
-        candidates.append(app_root / ".agents" / "skills" / "chadwin-research" / "scripts")
-
-    candidates.append(Path.home() / ".claude" / "skills" / "chadwin-research" / "scripts")
-    candidates.append(Path.home() / ".codex" / "skills" / "chadwin-research" / "scripts")
-
-    deduped: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        normalized = candidate.expanduser().resolve()
-        key = str(normalized)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(normalized)
-
-    for candidate in deduped:
-        if candidate.exists():
-            return candidate
-
-    checked = ", ".join(str(path) for path in deduped)
-    raise RuntimeError(
-        "Unable to locate chadwin-research queue scripts. "
-        f"Checked: {checked}. Set {SKILLS_DIR_ENV_VAR} when skills are installed elsewhere."
-    )
-
-
-QUEUE_SCRIPTS = _resolve_queue_scripts_dir()
-if str(QUEUE_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(QUEUE_SCRIPTS))
-
-from company_idea_queue import append_new_ideas, default_base_dir  # noqa: E402
-from company_idea_queue_core import (  # noqa: E402
-    load_user_preferences,
-    market_is_allowed,
-    matches_sector_industry_preferences,
-    resolve_preferences_path,
-)
+REPO_MARKER_RELATIVE_PATH = Path(".agents") / "skills"
+DEFAULT_PREFERENCES_SUBPATH = Path("user_preferences.json")
+DEFAULT_IDEA_SCREENS_SUBPATH = Path("idea-screens")
+SCREENER_RESULTS_FILENAME = "screener-results.jsonl"
+CANDIDATES_FILENAME = "finviz-candidates.json"
+RUN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}$")
+ISO_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 FINVIZ_BASE_URL = "https://finviz.com/screener.ashx"
 USER_AGENT = (
@@ -104,14 +40,11 @@ EXCHANGES = {
     "AMEX": "exch_amex",
 }
 
+# Keep this broad; the outer-loop LLM performs final selection.
 BASE_FILTERS = [
     "geo_usa",
     "ind_stocksonly",
     "cap_midover",
-    "fa_pe_u25",
-    "fa_roe_o15",
-    "fa_debteq_u1",
-    "fa_netmargin_o10",
     "sh_price_o5",
     "sh_avgvol_o200",
 ]
@@ -120,14 +53,108 @@ VIEWS = (111, 121, 161)
 ROWS_PER_PAGE = 20
 
 
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+
+    items: list[str] = []
+    for raw in values:
+        if raw is None:
+            continue
+        text = str(raw)
+        for piece in text.replace(";", ",").replace("\n", ",").split(","):
+            cleaned = piece.strip()
+            if cleaned:
+                items.append(cleaned)
+    return items
+
+
+def normalize_country_code(value: Any) -> str | None:
+    normalized = _clean_text(value).upper()
+    if not normalized:
+        return None
+    if ISO_COUNTRY_RE.match(normalized):
+        return normalized
+    return None
+
+
+def _detect_repo_root(start: Path | None = None) -> Path:
+    configured = os.getenv(APP_ROOT_ENV_VAR, "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = (Path.cwd() / configured_path).resolve()
+        if configured_path.exists():
+            return configured_path
+
+    candidate = (start or Path.cwd()).resolve()
+    if candidate.is_file():
+        candidate = candidate.parent
+
+    for parent in [candidate, *candidate.parents]:
+        if (parent / REPO_MARKER_RELATIVE_PATH).exists():
+            return parent
+    return Path.cwd().resolve()
+
+
+def _default_data_root() -> Path:
+    if os.name == "nt":
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            return Path(appdata) / APP_DATA_DIR_NAME
+        return Path.home() / "AppData" / "Roaming" / APP_DATA_DIR_NAME
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_DATA_DIR_NAME
+
+    xdg_data_home = os.getenv("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home).expanduser() / APP_DATA_DIR_NAME
+    return Path.home() / ".local" / "share" / APP_DATA_DIR_NAME
+
+
+def _resolve_data_root() -> Path:
+    configured = os.getenv(DATA_ROOT_ENV_VAR, "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_absolute():
+            return path
+        return (Path.cwd() / path).resolve()
+    return _default_data_root()
+
+
+def default_base_dir() -> Path:
+    return _detect_repo_root(Path(__file__).resolve())
+
+
+def resolve_idea_screens_root() -> Path:
+    return _resolve_data_root() / DEFAULT_IDEA_SCREENS_SUBPATH
+
+
+def _resolve_path(base_dir: Path, value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
 def repo_scoped_path(path: Path, base_dir: Path) -> str:
     base = base_dir.resolve()
-    candidate = path if path.is_absolute() else (base / path)
-    resolved_candidate = candidate.resolve()
+    resolved_candidate = path.resolve()
     try:
         relative = resolved_candidate.relative_to(base)
     except ValueError:
-        return str(candidate)
+        return str(path)
 
     relative_text = relative.as_posix()
     if not relative_text or relative_text == ".":
@@ -135,113 +162,72 @@ def repo_scoped_path(path: Path, base_dir: Path) -> str:
     return f"{base.name}/{relative_text}"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Screen US exchange-listed stocks and emit a structured list of "
-            "possible value + quality ideas."
-        )
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Maximum number of ideas to return.",
-    )
-    parser.add_argument(
-        "--max-pages-per-exchange",
-        type=int,
-        default=4,
-        help="How many screener pages to scan for each US exchange.",
-    )
-    parser.add_argument(
-        "--min-market-cap-b",
-        type=float,
-        default=2.0,
-        help="Minimum market cap in USD billions.",
-    )
-    parser.add_argument(
-        "--max-pe",
-        type=float,
-        default=25.0,
-        help="Maximum trailing P/E ratio.",
-    )
-    parser.add_argument(
-        "--min-roe",
-        type=float,
-        default=15.0,
-        help="Minimum return on equity (percent).",
-    )
-    parser.add_argument(
-        "--min-roic",
-        type=float,
-        default=10.0,
-        help="Minimum return on invested capital (percent).",
-    )
-    parser.add_argument(
-        "--min-operating-margin",
-        type=float,
-        default=10.0,
-        help="Minimum operating margin (percent).",
-    )
-    parser.add_argument(
-        "--min-profit-margin",
-        type=float,
-        default=10.0,
-        help="Minimum net profit margin (percent).",
-    )
-    parser.add_argument(
-        "--max-debt-to-equity",
-        type=float,
-        default=1.0,
-        help="Maximum debt-to-equity ratio.",
-    )
-    parser.add_argument(
-        "--request-delay",
-        type=float,
-        default=0.2,
-        help="Delay between HTTP requests to reduce rate-limit risk.",
-    )
-    parser.add_argument(
-        "--base-dir",
-        default=str(default_base_dir()),
-        help=(
-            "Repository root used for screener result queue paths "
-            "(default: auto-detected)."
-        ),
-    )
-    parser.add_argument(
-        "--ideas-log",
-        help=(
-            "Override screener results path "
-            "(file or directory; defaults to <DATA_ROOT>/idea-screens/**/screener-results.jsonl)."
-        ),
-    )
-    parser.add_argument(
-        "--preferences-path",
-        help="Override preferences path (default: <DATA_ROOT>/user_preferences.json).",
-    )
-    parser.add_argument(
-        "--ignore-preferences",
-        action="store_true",
-        help="Ignore preference-based filters and market guardrails.",
-    )
-    args = parser.parse_args()
+def resolve_preferences_path(
+    *,
+    base_dir: Path,
+    preferences_path: str | Path | None,
+) -> Path:
+    if preferences_path is None:
+        return _resolve_data_root() / DEFAULT_PREFERENCES_SUBPATH
+    return _resolve_path(base_dir, preferences_path)
 
-    if args.limit <= 0:
-        parser.error("--limit must be greater than 0.")
-    if args.max_pages_per_exchange <= 0:
-        parser.error("--max-pages-per-exchange must be greater than 0.")
-    if args.min_market_cap_b < 0:
-        parser.error("--min-market-cap-b cannot be negative.")
-    if args.max_pe <= 0:
-        parser.error("--max-pe must be greater than 0.")
-    if args.max_debt_to_equity <= 0:
-        parser.error("--max-debt-to-equity must be greater than 0.")
-    if args.request_delay < 0:
-        parser.error("--request-delay cannot be negative.")
 
-    return args
+def load_user_preferences(
+    *,
+    base_dir: Path,
+    preferences_path: str | Path | None,
+) -> dict[str, Any]:
+    path = resolve_preferences_path(base_dir=base_dir, preferences_path=preferences_path)
+    if not path.exists():
+        return {}
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def preferred_countries(preferences: dict[str, Any] | None) -> set[str]:
+    if not isinstance(preferences, dict):
+        return set()
+
+    markets = preferences.get("markets")
+    if not isinstance(markets, dict):
+        return set()
+
+    selected: set[str] = set()
+    for country in _string_list(markets.get("included_countries")):
+        country_code = normalize_country_code(country)
+        if country_code:
+            selected.add(country_code)
+    return selected
+
+
+def market_is_allowed(
+    market: str,
+    preferences: dict[str, Any] | None,
+    exchange_country: str | None = None,
+) -> bool:
+    selected_countries = preferred_countries(preferences)
+    if not selected_countries:
+        return True
+
+    normalized_market = _clean_text(market).lower()
+    if normalized_market == "us":
+        return "US" in selected_countries
+
+    allowed_non_us = {country for country in selected_countries if country != "US"}
+    if not allowed_non_us:
+        return False
+
+    country_code = normalize_country_code(exchange_country)
+    if country_code:
+        return country_code in allowed_non_us
+    return False
 
 
 def _request(url: str, delay_seconds: float) -> str:
@@ -303,6 +289,43 @@ def fetch_view_rows(
     return _parse_table_rows(_request(url=url, delay_seconds=delay_seconds))
 
 
+def merge_exchange_rows(
+    *,
+    exchange_name: str,
+    exchange_filter: str,
+    max_pages: int,
+    delay_seconds: float,
+) -> list[dict[str, str]]:
+    merged: dict[str, dict[str, str]] = {}
+    for page in range(max_pages):
+        start_row = 1 + (page * ROWS_PER_PAGE)
+        page_rows: dict[int, list[dict[str, str]]] = {}
+        for view in VIEWS:
+            page_rows[view] = fetch_view_rows(
+                view=view,
+                exchange_filter=exchange_filter,
+                start_row=start_row,
+                delay_seconds=delay_seconds,
+            )
+
+        min_count = min(len(rows) for rows in page_rows.values())
+        if min_count == 0:
+            break
+
+        for view_rows in page_rows.values():
+            for row in view_rows:
+                ticker = _clean_text(row.get("Ticker")).upper()
+                if not ticker:
+                    continue
+                slot = merged.setdefault(ticker, {"Ticker": ticker, "Exchange": exchange_name})
+                slot.update(row)
+
+        if min_count < ROWS_PER_PAGE:
+            break
+
+    return list(merged.values())
+
+
 def parse_percent(value: str | None) -> float | None:
     if value is None or value in {"", "-"}:
         return None
@@ -344,242 +367,499 @@ def parse_market_cap(value: str | None) -> float | None:
         return None
 
 
-def as_pct_string(value: float | None) -> str:
-    return f"{value:.1f}%" if value is not None else "n/a"
+def build_candidate(row: dict[str, str]) -> dict[str, Any] | None:
+    ticker = _clean_text(row.get("Ticker")).upper()
+    if not ticker:
+        return None
+
+    market_cap = parse_market_cap(row.get("Market Cap"))
+
+    return {
+        "ticker": ticker,
+        "company": _clean_text(row.get("Company")),
+        "exchange": _clean_text(row.get("Exchange")),
+        "sector": _clean_text(row.get("Sector")),
+        "industry": _clean_text(row.get("Industry")),
+        "market": "us",
+        "exchange_country": "US",
+        "metrics": {
+            "market_cap_usd": round(market_cap) if market_cap is not None else None,
+            "pe": parse_float(row.get("P/E")),
+            "forward_pe": parse_float(row.get("Fwd P/E")),
+            "price_to_book": parse_float(row.get("P/B")),
+            "roe_pct": parse_percent(row.get("ROE")),
+            "roic_pct": parse_percent(row.get("ROIC")),
+            "operating_margin_pct": parse_percent(row.get("Oper M")),
+            "profit_margin_pct": parse_percent(row.get("Profit M")),
+            "debt_to_equity": parse_float(row.get("Debt/Eq")),
+            "eps_next_5y_pct": parse_percent(row.get("EPS Next 5Y")),
+        },
+    }
 
 
-def as_ratio_string(value: float | None) -> str:
-    return f"{value:.2f}" if value is not None else "n/a"
-
-
-def as_multiple_string(value: float | None) -> str:
-    return f"{value:.1f}x" if value is not None else "n/a"
-
-
-def build_thesis(row: dict[str, Any]) -> str:
-    pe = row["metrics"]["pe"]
-    fwd_pe = row["metrics"]["forward_pe"]
-    roe = row["metrics"]["roe_pct"]
-    roic = row["metrics"]["roic_pct"]
-    debt_to_equity = row["metrics"]["debt_to_equity"]
-    operating_margin = row["metrics"]["operating_margin_pct"]
-
-    value_part = (
-        f"trades near {as_multiple_string(pe)} P/E "
-        f"(forward {as_multiple_string(fwd_pe)})"
-    )
-    quality_part = (
-        f"while generating ROE {as_pct_string(roe)}, "
-        f"ROIC {as_pct_string(roic)}, "
-        f"operating margin {as_pct_string(operating_margin)}"
-    )
-    leverage_part = f"and Debt/Equity {as_ratio_string(debt_to_equity)}"
-    return f"Possible value-quality setup: {value_part} {quality_part} {leverage_part}."
-
-
-def score_candidate(
-    *,
-    pe: float | None,
-    fwd_pe: float | None,
-    pb: float | None,
-    roe: float | None,
-    roic: float | None,
-    operating_margin: float | None,
-    profit_margin: float | None,
-    debt_to_equity: float | None,
-    eps_next_5y: float | None,
-    max_pe: float,
-    max_debt_to_equity: float,
-) -> float:
-    value_score = 0.0
-    if pe and pe > 0:
-        value_score += max(0.0, (max_pe - pe) / max_pe) * 40
-    if fwd_pe and fwd_pe > 0:
-        value_score += max(0.0, (max_pe - fwd_pe) / max_pe) * 20
-    if pb and pb > 0:
-        value_score += max(0.0, (6.0 - pb) / 6.0) * 10
-
-    quality_score = 0.0
-    if roe is not None:
-        quality_score += min(roe / 30.0, 1.0) * 10
-    if roic is not None:
-        quality_score += min(roic / 25.0, 1.0) * 10
-    if operating_margin is not None:
-        quality_score += min(operating_margin / 25.0, 1.0) * 10
-    if profit_margin is not None:
-        quality_score += min(profit_margin / 20.0, 1.0) * 5
-    if debt_to_equity is not None and max_debt_to_equity > 0:
-        debt_component = max(0.0, 1.0 - (debt_to_equity / max_debt_to_equity))
-        quality_score += min(debt_component, 1.0) * 5
-
-    growth_score = 0.0
-    if eps_next_5y is not None:
-        growth_score = min(max(eps_next_5y, 0.0) / 15.0, 1.0) * 10
-
-    return round(value_score + quality_score + growth_score, 2)
-
-
-def merge_exchange_rows(
-    *,
-    exchange_name: str,
-    exchange_filter: str,
-    max_pages: int,
-    delay_seconds: float,
-) -> list[dict[str, str]]:
-    merged: dict[str, dict[str, str]] = {}
-    for page in range(max_pages):
-        start_row = 1 + (page * ROWS_PER_PAGE)
-        page_rows: dict[int, list[dict[str, str]]] = {}
-        for view in VIEWS:
-            rows = fetch_view_rows(
-                view=view,
-                exchange_filter=exchange_filter,
-                start_row=start_row,
-                delay_seconds=delay_seconds,
-            )
-            page_rows[view] = rows
-
-        min_count = min(len(rows) for rows in page_rows.values())
-        if min_count == 0:
-            break
-
-        for view_rows in page_rows.values():
-            for row in view_rows:
-                ticker = row.get("Ticker")
-                if not ticker:
-                    continue
-                slot = merged.setdefault(ticker, {"Ticker": ticker, "Exchange": exchange_name})
-                slot.update(row)
-
-        if min_count < ROWS_PER_PAGE:
-            break
-    return list(merged.values())
-
-
-def select_ideas(
+def collect_candidates(
     raw_rows: list[dict[str, str]],
-    args: argparse.Namespace,
     *,
-    preferences: dict[str, Any] | None = None,
+    limit: int,
 ) -> list[dict[str, Any]]:
-    ideas: list[dict[str, Any]] = []
-    min_market_cap = args.min_market_cap_b * 1_000_000_000.0
+    candidates: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
 
     for row in raw_rows:
-        ticker = row.get("Ticker")
-        if not ticker:
+        candidate = build_candidate(row)
+        if not candidate:
             continue
 
-        market_cap = parse_market_cap(row.get("Market Cap"))
-        pe = parse_float(row.get("P/E"))
-        fwd_pe = parse_float(row.get("Fwd P/E"))
-        pb = parse_float(row.get("P/B"))
-        roe = parse_percent(row.get("ROE"))
-        roic = parse_percent(row.get("ROIC"))
-        operating_margin = parse_percent(row.get("Oper M"))
-        profit_margin = parse_percent(row.get("Profit M"))
-        debt_to_equity = parse_float(row.get("Debt/Eq"))
-        eps_next_5y = parse_percent(row.get("EPS Next 5Y"))
-        sector = row.get("Sector")
-        industry = row.get("Industry")
-
-        if market_cap is None or market_cap < min_market_cap:
-            continue
-        if pe is None or pe <= 0 or pe > args.max_pe:
-            continue
-        if roe is None or roe < args.min_roe:
-            continue
-        if roic is None or roic < args.min_roic:
-            continue
-        if operating_margin is None or operating_margin < args.min_operating_margin:
-            continue
-        if profit_margin is None or profit_margin < args.min_profit_margin:
-            continue
-        if debt_to_equity is None or debt_to_equity > args.max_debt_to_equity:
-            continue
-        if preferences and not matches_sector_industry_preferences(
-            {"sector": sector, "industry": industry},
-            preferences,
-        ):
+        ticker = candidate["ticker"]
+        if ticker in seen_tickers:
             continue
 
-        score = score_candidate(
-            pe=pe,
-            fwd_pe=fwd_pe,
-            pb=pb,
-            roe=roe,
-            roic=roic,
-            operating_margin=operating_margin,
-            profit_margin=profit_margin,
-            debt_to_equity=debt_to_equity,
-            eps_next_5y=eps_next_5y,
-            max_pe=args.max_pe,
-            max_debt_to_equity=args.max_debt_to_equity,
+        seen_tickers.add(ticker)
+        candidates.append(candidate)
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def _new_screen_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+
+
+def _ensure_valid_screen_run_id(run_id: str, *, context: str) -> None:
+    if not RUN_ID_RE.match(run_id):
+        raise ValueError(
+            f"Invalid {context}: '{run_id}'. Expected format YYYY-MM-DD-HHMMSS."
         )
 
-        idea = {
-            "ticker": ticker,
-            "company": row.get("Company"),
-            "exchange": row.get("Exchange"),
-            "sector": sector,
-            "industry": industry,
-            "score": score,
-            "thesis": "",
-            "metrics": {
-                "market_cap_usd": round(market_cap),
-                "pe": pe,
-                "forward_pe": fwd_pe,
-                "price_to_book": pb,
-                "roe_pct": roe,
-                "roic_pct": roic,
-                "operating_margin_pct": operating_margin,
-                "profit_margin_pct": profit_margin,
-                "debt_to_equity": debt_to_equity,
-                "eps_next_5y_pct": eps_next_5y,
-            },
-        }
-        idea["thesis"] = build_thesis(idea)
-        ideas.append(idea)
 
-    ideas.sort(key=lambda item: item["score"], reverse=True)
-    return ideas[: args.limit]
+def _extract_screen_run_id_from_path(path: Path) -> str | None:
+    parts = path.parts
+    marker = DEFAULT_IDEA_SCREENS_SUBPATH.name
+    for index, part in enumerate(parts):
+        if part != marker:
+            continue
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _looks_like_directory_path(path: Path, expected_filename: str) -> bool:
+    return path.suffix == "" and path.name != expected_filename
+
+
+def _resolve_output_json_path(args: argparse.Namespace, *, base_dir: Path) -> tuple[Path, str]:
+    if args.output_json:
+        output_path = _resolve_path(base_dir, args.output_json)
+    elif args.ideas_log:
+        legacy_path = _resolve_path(base_dir, args.ideas_log)
+        if _looks_like_directory_path(legacy_path, SCREENER_RESULTS_FILENAME):
+            output_path = legacy_path / CANDIDATES_FILENAME
+        elif legacy_path.name == SCREENER_RESULTS_FILENAME:
+            output_path = legacy_path.parent / CANDIDATES_FILENAME
+        else:
+            output_path = legacy_path.parent / CANDIDATES_FILENAME
+    else:
+        run_id = args.screen_run_id or _new_screen_run_id()
+        output_path = resolve_idea_screens_root() / run_id / CANDIDATES_FILENAME
+
+    if _looks_like_directory_path(output_path, CANDIDATES_FILENAME):
+        output_path = output_path / CANDIDATES_FILENAME
+
+    run_id_from_path = _extract_screen_run_id_from_path(output_path)
+
+    requested_run_id = _clean_text(args.screen_run_id)
+    if requested_run_id:
+        _ensure_valid_screen_run_id(requested_run_id, context="--screen-run-id")
+
+    if run_id_from_path:
+        _ensure_valid_screen_run_id(run_id_from_path, context=f"path {output_path}")
+        if requested_run_id and requested_run_id != run_id_from_path:
+            raise ValueError(
+                "--screen-run-id does not match the run folder in --output-json/--ideas-log."
+            )
+
+    resolved_run_id = requested_run_id or run_id_from_path or _new_screen_run_id()
+    _ensure_valid_screen_run_id(resolved_run_id, context="screen run id")
+
+    return output_path, resolved_run_id
+
+
+def _resolve_screener_results_path(
+    args: argparse.Namespace,
+    *,
+    base_dir: Path,
+    output_json_path: Path,
+    screen_run_id: str,
+) -> Path:
+    if args.ideas_log:
+        path = _resolve_path(base_dir, args.ideas_log)
+        if _looks_like_directory_path(path, SCREENER_RESULTS_FILENAME):
+            path = path / SCREENER_RESULTS_FILENAME
+        elif path.name == CANDIDATES_FILENAME:
+            path = path.parent / SCREENER_RESULTS_FILENAME
+    else:
+        path = output_json_path.parent / SCREENER_RESULTS_FILENAME
+
+    run_id_from_path = _extract_screen_run_id_from_path(path)
+    if run_id_from_path:
+        _ensure_valid_screen_run_id(run_id_from_path, context=f"path {path}")
+        if run_id_from_path != screen_run_id:
+            raise ValueError(
+                "Resolved screener-results path run folder does not match screen run id."
+            )
+    return path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fetch a broad US universe snapshot from Finviz and append LLM-selected "
+            "ideas to screener-results.jsonl."
+        )
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=150,
+        help="Maximum number of candidates to write.",
+    )
+    parser.add_argument(
+        "--idea-limit",
+        type=int,
+        default=25,
+        help="Maximum number of selected ideas to append to screener-results.jsonl.",
+    )
+    parser.add_argument(
+        "--max-pages-per-exchange",
+        type=int,
+        default=4,
+        help="How many screener pages to scan for each US exchange.",
+    )
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=0.2,
+        help="Delay between HTTP requests to reduce rate-limit risk.",
+    )
+    parser.add_argument(
+        "--base-dir",
+        default=str(default_base_dir()),
+        help="Repository root used for resolving relative paths (default: auto-detected).",
+    )
+    parser.add_argument(
+        "--preferences-path",
+        help="Override preferences path (default: <DATA_ROOT>/user_preferences.json).",
+    )
+    parser.add_argument(
+        "--ignore-preferences",
+        action="store_true",
+        help="Ignore preference-based market guardrails.",
+    )
+    parser.add_argument(
+        "--screen-run-id",
+        help="Screen run id in strict format YYYY-MM-DD-HHMMSS.",
+    )
+    parser.add_argument(
+        "--output-json",
+        help=(
+            "Output path for fetched candidate payload JSON "
+            "(default: <DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/finviz-candidates.json)."
+        ),
+    )
+    parser.add_argument(
+        "--ideas-log",
+        help=(
+            "Output path for screener queue JSONL "
+            "(default: <DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl)."
+        ),
+    )
+    parser.add_argument(
+        "--selection-json",
+        help=(
+            "Path to LLM-selected ideas JSON (or '-' for stdin). "
+            "Accepted shape: {'ideas':[{'ticker','thesis',...}]}."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="Only fetch candidates and write finviz-candidates.json; do not write screener-results.",
+    )
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help=(
+            "Keep run artifacts after append. By default, run-local finviz candidates "
+            "and selection files are cleaned up after successful screener append."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.limit <= 0:
+        parser.error("--limit must be greater than 0.")
+    if args.idea_limit <= 0:
+        parser.error("--idea-limit must be greater than 0.")
+    if args.max_pages_per_exchange <= 0:
+        parser.error("--max-pages-per-exchange must be greater than 0.")
+    if args.request_delay < 0:
+        parser.error("--request-delay cannot be negative.")
+
+    if args.screen_run_id:
+        try:
+            _ensure_valid_screen_run_id(args.screen_run_id, context="--screen-run-id")
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    if args.fetch_only and args.selection_json:
+        parser.error("--fetch-only cannot be combined with --selection-json.")
+
+    return args
 
 
 def build_payload(
-    ideas: list[dict[str, Any]],
-    args: argparse.Namespace,
     *,
+    candidates: list[dict[str, Any]],
+    args: argparse.Namespace,
     preferences_applied: bool,
     preferences_path: str | None,
+    output_json_path: Path,
+    screen_run_id: str,
 ) -> dict[str, Any]:
     return {
-        "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "source": "finviz_screener",
+        "fetched_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "screen_run_id": screen_run_id,
+        "output_json": str(output_json_path),
         "universe": {
             "country": "USA",
             "exchanges": list(EXCHANGES.keys()),
         },
         "filters": {
-            "min_market_cap_b": args.min_market_cap_b,
-            "max_pe": args.max_pe,
-            "min_roe_pct": args.min_roe,
-            "min_roic_pct": args.min_roic,
-            "min_operating_margin_pct": args.min_operating_margin,
-            "min_profit_margin_pct": args.min_profit_margin,
-            "max_debt_to_equity": args.max_debt_to_equity,
+            "base_filters": list(BASE_FILTERS),
             "max_pages_per_exchange": args.max_pages_per_exchange,
+            "order": "-marketcap",
         },
         "preferences": {
             "applied": preferences_applied,
             "path": preferences_path,
         },
-        "ideas": ideas,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
     }
+
+
+def _strip_markdown_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if not lines:
+        return stripped
+
+    if lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _read_selection_payload(
+    selection_json: str,
+    *,
+    base_dir: Path,
+) -> list[dict[str, Any]]:
+    if selection_json == "-":
+        raw = sys.stdin.read()
+    else:
+        selection_path = _resolve_selection_json_path(selection_json, base_dir=base_dir)
+        if selection_path is None:
+            raise ValueError("selection path resolved to None")
+        raw = selection_path.read_text(encoding="utf-8")
+
+    payload_text = _strip_markdown_fence(raw)
+    payload = json.loads(payload_text)
+
+    if isinstance(payload, dict):
+        ideas = payload.get("ideas")
+        if not isinstance(ideas, list):
+            raise ValueError("selection payload object must include an 'ideas' list")
+        return [item for item in ideas if isinstance(item, dict)]
+
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    raise ValueError("selection payload must be a JSON object or array")
+
+
+def _resolve_selection_json_path(
+    selection_json: str,
+    *,
+    base_dir: Path,
+) -> Path | None:
+    if selection_json == "-":
+        return None
+    return _resolve_path(base_dir, selection_json)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _cleanup_artifacts(
+    *,
+    output_json_path: Path,
+    selection_json_path: Path | None,
+    screener_results_path: Path,
+    keep_artifacts: bool,
+) -> list[str]:
+    if keep_artifacts:
+        return []
+
+    cleaned: list[str] = []
+    run_dir = screener_results_path.resolve().parent
+
+    candidate_path = output_json_path.resolve()
+    if candidate_path.exists() and _is_within(candidate_path, run_dir):
+        candidate_path.unlink()
+        cleaned.append(str(candidate_path))
+
+    if selection_json_path is not None:
+        selection_path = selection_json_path.resolve()
+        if (
+            selection_path.exists()
+            and _is_within(selection_path, run_dir)
+            and selection_path != screener_results_path.resolve()
+            and selection_path != candidate_path
+        ):
+            selection_path.unlink()
+            cleaned.append(str(selection_path))
+
+    return cleaned
+
+
+def _normalize_selected_ideas(
+    *,
+    selected_payload: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    idea_limit: int,
+) -> list[dict[str, Any]]:
+    candidates_by_ticker: dict[str, dict[str, Any]] = {
+        _clean_text(candidate.get("ticker")).upper(): candidate for candidate in candidates
+    }
+
+    normalized: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+
+    for item in selected_payload:
+        ticker = _clean_text(item.get("ticker")).upper()
+        if not ticker or ticker in seen_tickers:
+            continue
+
+        candidate = candidates_by_ticker.get(ticker)
+        if candidate is None:
+            continue
+
+        thesis = _clean_text(item.get("thesis"))
+        if not thesis:
+            continue
+
+        entry = {
+            "ticker": ticker,
+            "company": _clean_text(item.get("company")) or _clean_text(candidate.get("company")),
+            "exchange": _clean_text(item.get("exchange")) or _clean_text(candidate.get("exchange")),
+            "sector": _clean_text(item.get("sector")) or _clean_text(candidate.get("sector")),
+            "industry": _clean_text(item.get("industry")) or _clean_text(candidate.get("industry")),
+            "market": "us",
+            "exchange_country": "US",
+            "thesis": thesis,
+        }
+
+        normalized.append(entry)
+        seen_tickers.add(ticker)
+        if len(normalized) >= idea_limit:
+            break
+
+    return normalized
+
+
+def _read_existing_tickers(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    tickers: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        ticker = _clean_text(payload.get("ticker")).upper()
+        if ticker:
+            tickers.add(ticker)
+    return tickers
+
+
+def _append_jsonl_lines(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch()
+
+    needs_leading_newline = False
+    if path.stat().st_size > 0:
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            needs_leading_newline = handle.read(1) != b"\n"
+
+    with path.open("a", encoding="utf-8") as handle:
+        if needs_leading_newline:
+            handle.write("\n")
+        for line in lines:
+            handle.write(line)
+            handle.write("\n")
+
+
+def append_selected_ideas(*, path: Path, selected_ideas: list[dict[str, Any]]) -> int:
+    existing_tickers = _read_existing_tickers(path)
+    lines_to_append: list[str] = []
+
+    for idea in selected_ideas:
+        ticker = _clean_text(idea.get("ticker")).upper()
+        if not ticker or ticker in existing_tickers:
+            continue
+
+        entry = {
+            "ticker": ticker,
+            "company": _clean_text(idea.get("company")),
+            "exchange": _clean_text(idea.get("exchange")),
+            "sector": _clean_text(idea.get("sector")),
+            "industry": _clean_text(idea.get("industry")),
+            "market": "us",
+            "exchange_country": "US",
+            "thesis": _clean_text(idea.get("thesis")),
+        }
+
+        lines_to_append.append(json.dumps(entry, ensure_ascii=True))
+        existing_tickers.add(ticker)
+
+    if lines_to_append:
+        _append_jsonl_lines(path, lines_to_append)
+
+    return len(lines_to_append)
 
 
 def main() -> int:
     args = parse_args()
-    base_dir = Path(args.base_dir)
+    base_dir = Path(args.base_dir).resolve()
+
     preferences_applied = not args.ignore_preferences
     resolved_preferences_path = resolve_preferences_path(
         base_dir=base_dir,
@@ -590,6 +870,7 @@ def main() -> int:
         if preferences_applied
         else {}
     )
+
     if preferences_applied and not market_is_allowed("us", preferences):
         raise SystemExit(
             "Preferences currently exclude US market. "
@@ -607,32 +888,108 @@ def main() -> int:
             )
         )
 
-    ideas = select_ideas(
+    candidates = collect_candidates(
         raw_rows,
-        args,
-        preferences=preferences if preferences_applied else None,
+        limit=args.limit,
     )
+
+    try:
+        output_json_path, screen_run_id = _resolve_output_json_path(args, base_dir=base_dir)
+        screener_results_path = _resolve_screener_results_path(
+            args,
+            base_dir=base_dir,
+            output_json_path=output_json_path,
+            screen_run_id=screen_run_id,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     payload = build_payload(
-        ideas,
-        args,
+        candidates=candidates,
+        args=args,
         preferences_applied=preferences_applied,
         preferences_path=(
             repo_scoped_path(resolved_preferences_path, base_dir=base_dir)
             if preferences_applied
             else None
         ),
+        output_json_path=output_json_path,
+        screen_run_id=screen_run_id,
     )
 
-    append_new_ideas(
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+    output_json_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    if args.fetch_only or not args.selection_json:
+        print(
+            json.dumps(
+                {
+                    "output_json": str(output_json_path),
+                    "ideas_log": str(screener_results_path),
+                    "screen_run_id": screen_run_id,
+                    "candidate_count": len(candidates),
+                    "fetch_only": bool(args.fetch_only),
+                    "selection_applied": False,
+                },
+                ensure_ascii=True,
+            )
+        )
+        return 0
+
+    selection_json_path = _resolve_selection_json_path(
+        args.selection_json,
         base_dir=base_dir,
-        ideas=ideas,
-        source="fetch-us-investment-ideas",
-        generated_at_utc=payload.get("generated_at_utc"),
-        source_output=args.ideas_log or "",
-        ideas_log=args.ideas_log,
-        include_source_metadata=False,
     )
 
+    try:
+        selected_payload = _read_selection_payload(
+            args.selection_json,
+            base_dir=base_dir,
+        )
+    except Exception as exc:
+        raise SystemExit(f"Failed to read --selection-json: {exc}") from exc
+
+    normalized_selected = _normalize_selected_ideas(
+        selected_payload=selected_payload,
+        candidates=candidates,
+        idea_limit=args.idea_limit,
+    )
+    if not normalized_selected:
+        raise SystemExit(
+            "No valid selected ideas after normalization. "
+            "Ensure selection JSON uses candidate tickers and includes non-empty thesis values."
+        )
+
+    appended_count = append_selected_ideas(
+        path=screener_results_path,
+        selected_ideas=normalized_selected,
+    )
+    cleaned_artifacts = _cleanup_artifacts(
+        output_json_path=output_json_path,
+        selection_json_path=selection_json_path,
+        screener_results_path=screener_results_path,
+        keep_artifacts=bool(args.keep_artifacts),
+    )
+
+    print(
+        json.dumps(
+            {
+                "output_json": str(output_json_path),
+                "ideas_log": str(screener_results_path),
+                "screen_run_id": screen_run_id,
+                "candidate_count": len(candidates),
+                "selected_count": len(normalized_selected),
+                "appended_count": appended_count,
+                "fetch_only": False,
+                "artifacts_cleaned": cleaned_artifacts,
+                "keep_artifacts": bool(args.keep_artifacts),
+            },
+            ensure_ascii=True,
+        )
+    )
     return 0
 
 
