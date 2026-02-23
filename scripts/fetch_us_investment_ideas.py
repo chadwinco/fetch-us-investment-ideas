@@ -630,6 +630,7 @@ def main() -> int:
         generated_at_utc=payload.get("generated_at_utc"),
         source_output=args.ideas_log or "",
         ideas_log=args.ideas_log,
+        include_source_metadata=False,
     )
 
     return 0

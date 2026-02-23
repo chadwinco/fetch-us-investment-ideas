@@ -27,7 +27,7 @@ When present, apply `<DATA_ROOT>/user_preferences.json` by default:
 - Use one run folder per screen: `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/`.
 - Append queue rows only to `<DATA_ROOT>/idea-screens/<SCREEN_RUN_ID>/screener-results.jsonl`.
 - Ensure every queue row includes required fields: `ticker`, `exchange_country` (set `US` for this skill).
-- Prefer including recommended queue fields when available: `company`, `exchange`, `sector`, `industry`, `thesis`, `source`, `generated_at_utc`, `queued_at_utc`, `source_output`.
+- Prefer including recommended queue fields when available: `company`, `exchange`, `sector`, `industry`, `thesis`.
 - Do not repurpose reserved shared primitive paths.
 
 ## Skill Path (set once)
@@ -73,10 +73,7 @@ Each JSONL row in `screener-results.jsonl` should include:
   "exchange": "NASDAQ",
   "sector": "Technology",
   "industry": "Software - Application",
-  "thesis": "Concise rationale",
-  "source": "fetch-us-investment-ideas",
-  "generated_at_utc": "2026-02-12T18:00:00+00:00",
-  "queued_at_utc": "2026-02-12T18:00:10+00:00"
+  "thesis": "Concise rationale"
 }
 ```
 
