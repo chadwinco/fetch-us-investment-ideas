@@ -14,9 +14,8 @@ The helper script performs external data fetch and queue-file writes:
 
 If Finviz candidates do not match the user query well enough, use web search in the outer loop and append final rows directly to `screener-results.jsonl`.
 
-When present, apply `<DATA_ROOT>/user_preferences.json` by default:
-- US market guardrail (skip/fail if US is excluded)
-- sector/industry preference interpretation in the outer-loop LLM
+When present, use `<DATA_ROOT>/user_preferences.md` as optional context for outer-loop LLM idea selection/writing.
+The helper script does not enforce deterministic preference guardrails.
 
 ## Invocation Style (Codex + Claude)
 - Codex explicit invocation: `$fetch-us-investment-ideas`.
@@ -122,12 +121,11 @@ Each JSONL row in `screener-results.jsonl` should include:
 - `--idea-limit`: max number of selected ideas appended.
 - `--max-pages-per-exchange`: controls scan breadth per exchange.
 - `--request-delay`: delay between HTTP requests.
-- `--preferences-path`: override preferences path (default `<DATA_ROOT>/user_preferences.json`).
-- `--ignore-preferences`: ignore preference-based market guardrails.
+- `--preferences-path`: override preferences path (default `<DATA_ROOT>/user_preferences.md`).
+- `--ignore-preferences`: ignore markdown preference context.
 
 ## Troubleshooting
-- If Finviz payload is empty, raise `--max-pages-per-exchange` or rerun with `--ignore-preferences`.
-- If preferences exclude US market, update `<DATA_ROOT>/user_preferences.json` or rerun with `--ignore-preferences`.
+- If Finviz payload is empty, raise `--max-pages-per-exchange`.
 - If requests fail intermittently, raise `--request-delay` and retry.
 - If run id validation fails, use exactly `YYYY-MM-DD-HHMMSS` with no suffix.
 - If append result is empty, verify `ticker` values in `--selection-json` exist in fetched candidates, or use web-search-driven idea selection.

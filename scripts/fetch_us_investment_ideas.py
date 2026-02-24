@@ -21,12 +21,11 @@ APP_DATA_DIR_NAME = "Chadwin"
 DATA_ROOT_ENV_VAR = "CHADWIN_DATA_DIR"
 APP_ROOT_ENV_VAR = "CHADWIN_APP_ROOT"
 REPO_MARKER_RELATIVE_PATH = Path(".agents") / "skills"
-DEFAULT_PREFERENCES_SUBPATH = Path("user_preferences.json")
+DEFAULT_PREFERENCES_SUBPATH = Path("user_preferences.md")
 DEFAULT_IDEA_SCREENS_SUBPATH = Path("idea-screens")
 SCREENER_RESULTS_FILENAME = "screener-results.jsonl"
 CANDIDATES_FILENAME = "finviz-candidates.json"
 RUN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}$")
-ISO_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 FINVIZ_BASE_URL = "https://finviz.com/screener.ashx"
 USER_AGENT = (
@@ -57,35 +56,6 @@ def _clean_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        values = value
-    else:
-        values = [value]
-
-    items: list[str] = []
-    for raw in values:
-        if raw is None:
-            continue
-        text = str(raw)
-        for piece in text.replace(";", ",").replace("\n", ",").split(","):
-            cleaned = piece.strip()
-            if cleaned:
-                items.append(cleaned)
-    return items
-
-
-def normalize_country_code(value: Any) -> str | None:
-    normalized = _clean_text(value).upper()
-    if not normalized:
-        return None
-    if ISO_COUNTRY_RE.match(normalized):
-        return normalized
-    return None
 
 
 def _detect_repo_root(start: Path | None = None) -> Path:
@@ -176,58 +146,15 @@ def load_user_preferences(
     *,
     base_dir: Path,
     preferences_path: str | Path | None,
-) -> dict[str, Any]:
+) -> str:
     path = resolve_preferences_path(base_dir=base_dir, preferences_path=preferences_path)
     if not path.exists():
-        return {}
+        return ""
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        return path.read_text(encoding="utf-8")
     except Exception:
-        return {}
-
-    if isinstance(payload, dict):
-        return payload
-    return {}
-
-
-def preferred_countries(preferences: dict[str, Any] | None) -> set[str]:
-    if not isinstance(preferences, dict):
-        return set()
-
-    markets = preferences.get("markets")
-    if not isinstance(markets, dict):
-        return set()
-
-    selected: set[str] = set()
-    for country in _string_list(markets.get("included_countries")):
-        country_code = normalize_country_code(country)
-        if country_code:
-            selected.add(country_code)
-    return selected
-
-
-def market_is_allowed(
-    market: str,
-    preferences: dict[str, Any] | None,
-    exchange_country: str | None = None,
-) -> bool:
-    selected_countries = preferred_countries(preferences)
-    if not selected_countries:
-        return True
-
-    normalized_market = _clean_text(market).lower()
-    if normalized_market == "us":
-        return "US" in selected_countries
-
-    allowed_non_us = {country for country in selected_countries if country != "US"}
-    if not allowed_non_us:
-        return False
-
-    country_code = normalize_country_code(exchange_country)
-    if country_code:
-        return country_code in allowed_non_us
-    return False
+        return ""
 
 
 def _request(url: str, delay_seconds: float) -> str:
@@ -549,12 +476,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preferences-path",
-        help="Override preferences path (default: <DATA_ROOT>/user_preferences.json).",
+        help="Override preferences path (default: <DATA_ROOT>/user_preferences.md).",
     )
     parser.add_argument(
         "--ignore-preferences",
         action="store_true",
-        help="Ignore preference-based market guardrails.",
+        help="Ignore markdown preference context (deterministic guardrails are disabled).",
     )
     parser.add_argument(
         "--screen-run-id",
@@ -865,17 +792,12 @@ def main() -> int:
         base_dir=base_dir,
         preferences_path=args.preferences_path,
     )
-    preferences = (
+    preferences_text = (
         load_user_preferences(base_dir=base_dir, preferences_path=args.preferences_path)
         if preferences_applied
-        else {}
+        else ""
     )
-
-    if preferences_applied and not market_is_allowed("us", preferences):
-        raise SystemExit(
-            "Preferences currently exclude US market. "
-            f"Update {resolved_preferences_path} or rerun with --ignore-preferences."
-        )
+    preferences_context_present = bool(preferences_text.strip())
 
     raw_rows: list[dict[str, str]] = []
     for exchange_name, exchange_filter in EXCHANGES.items():
@@ -910,7 +832,7 @@ def main() -> int:
         preferences_applied=preferences_applied,
         preferences_path=(
             repo_scoped_path(resolved_preferences_path, base_dir=base_dir)
-            if preferences_applied
+            if preferences_applied and preferences_context_present
             else None
         ),
         output_json_path=output_json_path,
